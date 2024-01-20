@@ -304,6 +304,7 @@ update_from:
 
 inc_addr:
     incf    ADDRESS, 1
+    bcf     FLAG_REG, GP3_SW
     call    update_from
     movlw   MAX_ADDR
     xorwf   ADDRESS, 0
@@ -317,6 +318,7 @@ inc_addr:
 
 inc_pa:
     incf    PAC_ADDR, 1
+    bcf     FLAG_REG, GP3_SW
     movlw   MAX_ADDR
     xorwf   PAC_ADDR, 0
     btfss   STATUS, Z
@@ -328,6 +330,7 @@ inc_pa:
 
 inc_pc:
     incf    PAC_CONT, 1
+    bcf     FLAG_REG, GP3_SW
     movlw   MAX_PAC_CONT
     xorwf   PAC_CONT, 0
     btfss   STATUS, Z
@@ -339,6 +342,7 @@ inc_pc:
 
 change_mode:
     incf    MODE, 1
+    bcf     FLAG_REG, GP0_SW
     movlw   MAX_MODE
     xorwf   MODE, 0
     btfss   STATUS, Z
