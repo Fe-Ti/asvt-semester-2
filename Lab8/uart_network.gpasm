@@ -1,0 +1,557 @@
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; Author : Tim Kravchenko
+; Date : 22 dec 2023
+; Version: 0.1
+; Title: Lab 6|8 ASVT
+; Description:
+; Build UART 8p1 half duplex network with bus topology and speed 19.2 Kb/s
+; HD and bus topo means TX and RX are connected to same wire, so we're can use
+; only GP5 for comms.
+;
+; 8p1 stands for:
+;   8 - data bits
+;   p - 1 parity
+;   1 - 1 stop
+; I.e. 11 bits per packet (10 + 1 start) and ~52 micro seconds per bit.
+; For ~1 Mhz cycle this means 52 tests for each bit.
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; GPIO Register:
+;    7     6     5     4     3     2     1     0
+; |  x  |  x  | GP5 | GP4 | GP3 | GP2 | GP1 | GP0 |
+;
+; AX-12(13) Configuration
+; GP0 == SW_GP0
+; GP1 == LED_DATA
+; GP2 == LED_LATCH
+; GP3 == SW_GP3
+; GP4 == LED_CLK
+; GP5 == SerialIn (and out due to HD mode)
+
+
+
+    processor p12f675
+    #include <p12f675.inc>
+    __config _INTRC_OSC_NOCLKOUT & _WDT_OFF & _PWRTE_ON & _MCLRE_OFF
+
+BIT_SAMPLES equ 0x30     ; 52 samples for each minus routine cycles
+PACDATA_LEN equ 0x8             ; Data length
+PARITY_ENBL equ 0x1             ; Parity enable
+PACSTOP_LEN equ 0x1             ; Packet stop length
+
+SETUP_MODE  equ 0x0             ; Address setup mode identifier
+RUN_MODE    equ 0x1           ; Run mode id (used for handling interrupts)
+SETTING_PC_MODE equ 0x2
+SETTING_PA_MODE equ 0x3
+MAX_MODE    equ 0x4
+
+
+GP0_SW      equ 0x00
+GP3_SW      equ 0x03
+GP5_RECVD   equ 0x05
+CAN_SEND    equ 0x01
+IS_NOT_WAITING  equ 0x02
+SEND_READY  equ 0x04
+
+LED_CLK     equ 0x04
+LED_LATCH   equ 0x02
+LED_DATA    equ 0x01
+SERIAL_OUT  equ 0x01
+SERIAL_IN   equ 0x05
+
+MASTER_ADDR equ 0x01
+
+MAX_ADDR    equ     0x05
+MAX_PAC_CONT equ    0x16 ; actually max+1
+
+;~ GP_CTR      equ 0x21 ; General purpose counter (used in reset)
+;~ CHAR_IO_CTR equ 0x22 ; 
+;~ CHAR_IO_REG equ 0x23
+
+REG_BANK_ADDR equ 0x30 ; Address of registers, which are cleared every reset
+REG_BANK_SIZE equ 0x13
+
+IN_PAC_PAR      equ 0x1
+OUT_PAC_PAR     equ 0x2
+
+    cblock 0x30
+        ADDRESS
+        MODE
+        PAC_ADDR
+        PAC_CONT
+        RECVPAC ; recieving buffer
+        RECVPAC_CTR_1
+        RECVPAC_CTR_0
+        RECVPAC_GPCTR1
+        RECVPAC_GPCTR2
+        RECVPAC_ADDR
+        RECVPAC_FROM
+        PARITY_REG
+        PACKET_REG ; packet for transmitting
+        RECIEVED_REG ; recieved packet
+        FLAG_REG
+        TRANSMIT_GPCTR1
+        TRANSMIT_GPCTR2
+        DELAY_CTR1
+        DELAY_CTR2
+        DELAY_CTR3
+        GP_CTR
+        CHAR_IO_CTR
+        CHAR_IO_REG
+        FROM
+    endc
+
+    org 0
+    goto gpio_init
+
+    org 0x04
+    goto int_handler
+    
+int_handler:
+    btfss   GPIO, SERIAL_IN
+    call    recieve_packet
+    btfsc   GPIO, GP3_SW
+    call    delay_20ms
+    btfsc   GPIO, GP0_SW
+    call    delay_20ms
+    btfss   GPIO, GP3_SW
+    bsf     FLAG_REG, GP3_SW
+    btfss   GPIO, GP0_SW
+    bsf     FLAG_REG, GP0_SW
+    call    delay_2ms
+    btfss   GPIO, GP3_SW
+    goto    $-2
+    call    delay_2ms
+    btfss   GPIO, GP0_SW
+    goto    $-2
+    call    delay_20ms
+    bcf     INTCON, GPIF
+    retfie
+
+gpio_init:
+    ;~ call reg_reset
+    bcf     STATUS,RP0  ;Bank 0
+    clrf    GPIO        ;Init GPIO
+    movlw   0x07        ;Set GP<2:0> to
+    movwf   CMCON       ;digital IO (Disable comparator)
+    bsf     STATUS,RP0  ;Bank 1
+    clrf    ANSEL       ;Digital I/O
+    movlw   b'00101001' ;Set GP<5,3> as inputs
+    movwf   TRISIO      ;and set other GP
+                        ;as outputs
+    movlw   b'10001000' ; Enable GIE and GPIO IntOnChange
+    movwf   INTCON
+    movlw   b'00101001' ; enable IOC for GP 3 and 5
+    movwf   IOC
+    bcf     STATUS, RP0 ; And switch to bank 0
+soft_reset:
+    movlw   REG_BANK_ADDR ; Register array address
+    movwf   FSR           ; is loaded to FSR
+    movlw   REG_BANK_SIZE ; Then loading size to GP_CTR
+    movwf   GP_CTR
+next_reg_reset:         ; Register clearing loop
+    clrf    INDF        ; use indirect access by pointer (FSR)
+    incf    FSR, 1      ; curent register pointer + 1
+    decfsz  GP_CTR, 1       ; decrement counter
+    goto    next_reg_reset  ; if we aren't done yet, then goto next
+    movlw   SETUP_MODE
+    movwf   MODE
+    goto loop
+
+process_msg:
+    movf    RECVPAC, 0
+    andlw   b'11000000'
+    movwf   RECVPAC_ADDR
+    movlw   0x6
+    movwf   GP_CTR
+    bcf     STATUS, C
+    rrf     RECVPAC_ADDR, 1
+    decfsz  GP_CTR, 1
+    goto    $-2
+    movf    RECVPAC_ADDR, 1
+    btfsc   STATUS, Z
+    goto    set_recieved_reg
+    movf    RECVPAC_ADDR, 0
+    xorwf   ADDRESS, 0
+    btfss   STATUS, Z
+    return
+
+set_recieved_reg:
+    movf    RECVPAC, 0
+    movwf   RECIEVED_REG
+    addlw   b'00110000'
+    movwf   RECVPAC_FROM
+    movlw   0x4
+    movwf   GP_CTR
+    bcf     STATUS, C
+    rrf     RECVPAC_FROM, 1
+    decfsz  GP_CTR, 1
+    goto    $-2
+    movf    RECIEVED_REG, 0
+    addlw   b'00001111'
+    movwf   RECIEVED_REG
+    return
+
+loop:
+    movlw   SETUP_MODE
+    xorwf   MODE, 0
+    btfsc   STATUS, Z         ; if MODE==RUN (Z flag = 1)
+    call    setup_sub            ; go to run handler
+    movlw   RUN_MODE
+    xorwf   MODE, 0
+    btfsc   STATUS, Z         ; if MODE==RUN (Z flag = 1)
+    call    run_sub            ; go to run handler
+    movlw   SETTING_PC_MODE
+    xorwf   MODE, 0
+    btfsc   STATUS, Z         ; if MODE == SET P[acket]C[ontents]
+    call    set_pc_sub
+    movlw   SETTING_PA_MODE
+    xorwf   MODE, 0
+    btfsc   STATUS, Z         ; if MODE == SET P[acket]A[ddress]
+    call    set_pa_sub
+    goto    loop
+
+setup_sub:
+    btfsc   FLAG_REG, GP0_SW
+    call    change_mode
+    btfsc   FLAG_REG, GP3_SW
+    call    inc_addr
+    movlw   b'11110000'
+    movwf   CHAR_IO_REG
+    call    output_char_reg
+    call    delay_500ms
+    movf    ADDRESS, 1
+    movwf   CHAR_IO_REG
+    call    output_char_reg
+    call    delay_500ms
+    return
+
+run_sub:
+    movlw   b'01010000'
+    movwf   CHAR_IO_REG
+    call    output_char_reg
+    btfsc   FLAG_REG, GP0_SW
+    call    change_mode
+    btfsc   FLAG_REG, GP3_SW
+    bsf     FLAG_REG, SEND_READY
+    btfsc   FLAG_REG, GP5_RECVD
+    call    process_msg
+    movlw   MASTER_ADDR
+    xorwf   ADDRESS, 0
+    btfss   STATUS, Z
+    goto    run_sub_slave
+run_sub_master:
+    btfsc   FLAG_REG, IS_NOT_WAITING
+    call    transmit_packet
+    return
+run_sub_slave:   
+    btfsc   FLAG_REG, CAN_SEND
+    call    transmit_packet
+    return
+
+set_pc_sub:
+    movlw   b'00111001'
+    movwf   CHAR_IO_REG
+    call    output_char_reg
+    call    delay_500ms
+    btfsc   FLAG_REG, GP0_SW
+    call    change_mode
+    btfsc   FLAG_REG, GP3_SW
+    call    inc_pc
+    movf    PACKET_REG, 0
+    movwf   CHAR_IO_REG
+    call    output_char_reg
+    call    delay_500ms
+    return
+
+set_pa_sub:
+    movlw   b'01110111'
+    movwf   CHAR_IO_REG
+    call    output_char_reg
+    call    delay_500ms
+    btfsc   FLAG_REG, GP0_SW
+    call    change_mode
+    btfsc   FLAG_REG, GP3_SW
+    call    inc_pa
+    movf    PACKET_REG, 0
+    movwf   CHAR_IO_REG
+    call    output_char_reg
+    call    delay_500ms
+    return
+
+view_sub:
+    movlw   b'00111110'
+    movwf   CHAR_IO_REG
+    call    output_char_reg
+    call    delay_500ms
+    btfsc   FLAG_REG, GP0_SW
+    call    change_mode
+    bcf     FLAG_REG, GP3_SW
+    movf    RECVPAC, 0
+    movwf   CHAR_IO_REG
+    call    output_char_reg
+    call    delay_500ms
+    return
+
+update_from:
+    movf    ADDRESS, 0
+    movwf   FROM
+    movlw   0x4
+    movwf   GP_CTR
+    rlf     FROM, 1
+    decfsz  GP_CTR, 1
+    goto    $-2
+    return
+
+inc_addr:
+    incf    ADDRESS, 1
+    call    update_from
+    movlw   MAX_ADDR
+    xorwf   ADDRESS, 0
+    btfss   STATUS, Z
+    return
+    movlw   0x1
+    movwf   ADDRESS
+    call    update_from
+    bcf     FLAG_REG, GP3_SW
+    return
+
+inc_pa:
+    incf    PAC_ADDR, 1
+    movlw   MAX_ADDR
+    xorwf   PAC_ADDR, 0
+    btfss   STATUS, Z
+    return
+    movlw   0x1
+    movwf   PAC_ADDR
+    bcf     FLAG_REG, GP3_SW
+    return
+
+inc_pc:
+    incf    PAC_CONT, 1
+    movlw   MAX_PAC_CONT
+    xorwf   PAC_CONT, 0
+    btfss   STATUS, Z
+    return
+    movlw   0x1
+    movwf   PAC_CONT
+    bcf     FLAG_REG, GP3_SW
+    return
+
+change_mode:
+    incf    MODE, 1
+    movlw   MAX_MODE
+    xorwf   MODE, 0
+    btfss   STATUS, Z
+    return
+    movlw   0x1
+    movwf   MODE
+    bcf     FLAG_REG, GP0_SW
+    return
+
+
+reg_reset:
+    call    hc595_set
+    call    delay_20ms
+    call    hc595_clear
+    return
+    
+hc595_clear:
+    bcf     GPIO, LED_DATA
+    bcf     GPIO, LED_LATCH
+    bcf     GPIO, LED_CLK
+    movlw   0x08
+    movwf   GP_CTR
+    bsf     GPIO, LED_CLK
+    bcf     GPIO, LED_CLK
+    decfsz  GP_CTR, 1
+    goto    $-3
+    bsf     GPIO, LED_LATCH
+    bcf     GPIO, LED_LATCH
+    return
+
+hc595_set:
+    bsf     GPIO, LED_DATA
+    bcf     GPIO, LED_LATCH
+    bcf     GPIO, LED_CLK
+    movlw   0x08
+    movwf   GP_CTR
+    bsf     GPIO, LED_CLK
+    bcf     GPIO, LED_CLK
+    decfsz  GP_CTR, 1
+    goto    $-3
+    bsf     GPIO, LED_LATCH
+    bcf     GPIO, LED_LATCH
+    return
+
+output_char_reg:
+    movlw   0x08
+    movwf   CHAR_IO_CTR
+    bcf     GPIO, LED_CLK
+    bcf     GPIO, LED_LATCH
+output_loop:
+    rlf     CHAR_IO_REG, 1
+    btfsc   STATUS, C
+    bsf     GPIO, LED_DATA
+    btfss   STATUS, C
+    bcf     GPIO, LED_DATA
+    bsf     GPIO, LED_CLK
+    bcf     GPIO, LED_CLK
+    decfsz  CHAR_IO_CTR, 1
+    goto    output_loop
+    bsf     GPIO, LED_LATCH
+    bcf     GPIO, LED_LATCH
+    return
+
+recieve_packet:
+    movf    MODE, 1
+    btfsc   STATUS, Z
+    return
+    movlw   PACDATA_LEN
+    movwf   RECVPAC_GPCTR1
+recieve_packet_cycle:           ;;;
+    call    sample_bit
+    movf    RECVPAC_CTR_0, W
+    subwf   RECVPAC_CTR_1, 1
+    rlf     RECVPAC, 1
+    decfsz  RECVPAC_GPCTR1, 1
+    goto    recieve_packet_cycle   ;;;
+    call    sample_bit
+    movf    RECVPAC_CTR_0, W
+    subwf   RECVPAC_CTR_1, 1
+    btfsc   STATUS, C
+    bsf     PARITY_REG, IN_PAC_PAR
+    btfss   STATUS, C
+    bcf     PARITY_REG, IN_PAC_PAR
+    bsf     FLAG_REG, GP5_RECVD
+    return
+
+sample_bit:
+    movlw   BIT_SAMPLES
+    movwf   RECVPAC_GPCTR2
+sample_bit_cycle:
+    btfsc   GPIO, SERIAL_IN
+    incf    RECVPAC_CTR_1, 1
+    btfss   GPIO, SERIAL_IN
+    incf    RECVPAC_CTR_0, 1
+    decfsz  RECVPAC_GPCTR2, 1
+    goto    sample_bit_cycle
+    return
+
+
+get_parity:
+    movlw   PACDATA_LEN
+    movwf   TRANSMIT_GPCTR1
+get_parity_cycle                    ;;;
+    rlf     PACKET_REG, 1
+    btfsc   STATUS, C
+    addlw   0x1
+    decfsz  TRANSMIT_GPCTR1, 1
+    goto    get_parity_cycle           ;;;
+    movwf   TRANSMIT_GPCTR1
+    btfsc   TRANSMIT_GPCTR1, 0x0
+    bsf     PARITY_REG, OUT_PAC_PAR
+    btfss   TRANSMIT_GPCTR1, 0x0
+    bcf     PARITY_REG, OUT_PAC_PAR
+    return
+
+serial_rx_enbl:
+    bsf     STATUS, RP0  ;Bank 1
+    clrf    ANSEL       ;Digital I/O
+    movlw   b'00101001' ;Set GP<5,3> as inputs
+    movwf   TRISIO      ;and set other GP
+    bcf     STATUS, RP0
+    return
+serial_tx_enbl:
+    bsf     STATUS, RP0  ;Bank 1
+    clrf    ANSEL       ;Digital I/O
+    movlw   b'00001001' ;Set GP<5,3> as inputs
+    movwf   TRISIO      ;and set other GP
+    bcf     STATUS, RP0
+    return
+
+assemble_packet: ; merge address, "from" and contents into 1 packet
+    bcf     STATUS, C
+    movlw   0x6
+    movwf   GP_CTR
+    rlf     PAC_ADDR, 1
+    decfsz  GP_CTR, 1
+    goto    $-2
+    movf    PAC_ADDR, 0
+    xorwf   PAC_CONT, 0
+    xorwf   FROM, 0
+    movwf   PACKET_REG
+    return
+
+transmit_packet:
+    call    get_parity
+    call    assemble_packet
+    call    serial_tx_enbl
+    movlw   PACDATA_LEN
+    movwf   TRANSMIT_GPCTR1
+bit_transmit:                   ;;;
+    rlf     PACKET_REG, 1
+    btfsc   STATUS, C
+    bsf     GPIO, SERIAL_IN
+    btfss   STATUS, C
+    bcf     GPIO, SERIAL_IN
+    call    wait_samp_time
+    decfsz  TRANSMIT_GPCTR1, 1
+    goto    bit_transmit           ;;;
+    btfsc   PARITY_REG, OUT_PAC_PAR
+    bsf     GPIO, SERIAL_IN
+    btfss   PARITY_REG, OUT_PAC_PAR
+    bcf     GPIO, SERIAL_IN
+    call    wait_samp_time
+    bsf     GPIO, SERIAL_IN ;; send stop bits
+    call    wait_samp_time
+    call    serial_rx_enbl
+    return
+
+wait_samp_time:
+    movlw   BIT_SAMPLES
+    movwf   TRANSMIT_GPCTR2
+wait_samp_t_cycle:
+    decfsz  TRANSMIT_GPCTR2, 1 ; wait for sampling
+    goto    wait_samp_t_cycle
+    return
+
+
+delay_2ms:
+    movlw   0x14
+    movwf   DELAY_CTR1
+    movlw   0x19
+    movwf   DELAY_CTR2
+    decfsz  DELAY_CTR2, 1
+    goto    $-1
+    decfsz  DELAY_CTR1, 1
+    goto    $-5
+    return
+        
+delay_20ms:
+    movlw   0xc8
+    movwf   DELAY_CTR1
+    movlw   0x19
+    movwf   DELAY_CTR2
+    decfsz  DELAY_CTR2, 1
+    goto    $-1
+    decfsz  DELAY_CTR1, 1
+    goto    $-5
+    return
+
+delay_100ms:
+    movlw   0x05
+    movwf   DELAY_CTR3
+    call    delay_20ms
+    decfsz  DELAY_CTR3, 1
+    goto    $-2
+    return
+
+delay_500ms:
+    call    delay_100ms
+    call    delay_100ms
+    call    delay_100ms
+    call    delay_100ms
+    call    delay_100ms
+    return
+
+    end

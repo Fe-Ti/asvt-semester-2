@@ -1,0 +1,364 @@
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; Author : Tim Kravchenko
+; Date : 22 dec 2023
+; Version: 0.1
+; Title: Lab 5|7 ASVT
+; Description:
+; Count SW2_GP3 presses til 10. Then output 1 to 7-segment display with beep.
+; And again count til 10 and output 2 with beep. SW3_GP5 resets the system.
+;
+; --------------------------
+; AX-12(13) Map
+; GP0 == Ain, SW1_GP0, Piezo
+; GP1 == LED_Data, SerialOut
+; GP2 == LED_Latch, 1-wire
+; GP3 == SW2_GP3
+; GP4 == LED_CLK
+; GP5 == SerialIn, SW3_GP5
+;
+;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;;
+; GPIO Register:
+;    7     6     5     4     3     2     1     0
+; |  x  |  x  | GP5 | GP4 | GP3 | GP2 | GP1 | GP0 |
+;
+; AX-12(13) Configuration
+; GP0 == PIEZO
+; GP1 == LED_DATA
+; GP2 == LED_LATCH
+; GP3 == SW_GP3
+; GP4 == LED_CLK
+; GP5 == SW3_GP5
+    processor p12f675
+
+    #include <p12f675.inc>
+    __config _INTRC_OSC_NOCLKOUT & _WDT_OFF & _PWRTE_ON & _MCLRE_OFF
+
+SW2 equ 0x03
+SW3 equ 0x05
+PIEZO equ 0x00
+LED_CLK equ 0x04
+LED_LATCH equ 0x02
+LED_DATA equ 0x01
+
+    ;~ errorlevel -302
+
+; Reset Vector
+
+    cblock 0x30
+        COUNTER_UPTO_10
+        COUNTER_UPTO_2
+        CHAR_REG
+        GP_COUNTER
+        GP_COUNTER1
+        GP_COUNTER2
+        GP_COUNTER3
+        DELAY_CTR1
+        DELAY_CTR2
+        DELAY_CTR3
+        DISP_LOOP_CTR
+    endc
+
+    org 0
+    goto gpio_init
+
+    org 0x0004
+    call handle_interrupt
+    retfie
+
+gpio_init:
+    bcf     STATUS,RP0  ;Bank 0
+    clrf    GPIO        ;Init GPIO
+    movlw   0x07        ;Set GP<2:0> to
+    movwf   CMCON       ;digital IO (Disable comparator)
+    bsf     STATUS,RP0  ;Bank 1
+    clrf    ANSEL       ;Digital I/O
+    movlw   b'00101000' ;Set GP<5,3> as inputs
+    movwf   TRISIO      ;and set other GP
+                        ;as outputs
+    clrf    INTCON      ; Clear Interrupt control
+    movlw   b'10001000' ; Enable GIE and GPIO IntOnChange
+    movwf   INTCON
+    movlw   b'00101000' ; enable IOC for GP 3 and 5
+    movwf   IOC
+
+; Select Bank 0 of memory by clearing the Register Bank Select bit (RP0) of
+; the STATUS register
+    bcf STATUS, RP0
+;~ init_7seg_symbols:
+    ;~ movlw b'00111111' ; 012345
+    ;~ movwf sym_0
+    ;~ movlw b'00000110' ; 12
+    ;~ movwf sym_1
+    ;~ movlw b'01011011' ; 01346
+    ;~ movwf sym_2
+    ;~ movlw b'01001111' ; 01236
+    ;~ movwf sym_3
+    ;~ movlw b'01100110' ; 1256
+    ;~ movwf sym_4
+    ;~ movlw b'01101101' ; 02356
+    ;~ movwf sym_5
+    ;~ movlw b'01111101' ; 023456
+    ;~ movwf sym_6
+    ;~ movlw b'00000111' ; 012
+    ;~ movwf sym_7
+    ;~ movlw b'01111111' ; 0123456
+    ;~ movwf sym_8
+    ;~ movlw b'01101111' ; 012356
+    ;~ movwf sym_9
+    ;~ movlw b'01110111' ; 012456
+    ;~ movwf sym_a
+    ;~ movlw b'01111100' ; 23456
+    ;~ movwf sym_b
+    ;~ movlw b'00111001' ; 0345
+    ;~ movwf sym_c
+    ;~ movlw b'01011110' ; 12346
+    ;~ movwf sym_d
+    ;~ movlw b'01111001' ; 03456
+    ;~ movwf sym_e
+    ;~ movlw b'01110001' ; 0456
+    ;~ movwf sym_f
+
+; Set byte at address GPIO in Bank 0 to 0, so that digital pin outputs will be
+; a known value (0, low).
+
+gpio_clear:
+    clrf GPIO
+    call reg_reset
+
+loop:
+    movlw 0x30
+    movwf DISP_LOOP_CTR
+    movf COUNTER_UPTO_2, W
+    movwf CHAR_REG
+    call convert_chr_to_7s
+    bsf CHAR_REG, 0x07
+    call output_char_reg ; output it
+    call delay_20ms
+    decfsz DISP_LOOP_CTR, 1
+    goto $-7
+    movlw 0x30
+    movwf DISP_LOOP_CTR
+    movf COUNTER_UPTO_10, W
+    movwf CHAR_REG
+    call convert_chr_to_7s
+    call output_char_reg ; output it
+    call delay_20ms
+    decfsz DISP_LOOP_CTR, 1
+    goto $-6
+    goto loop
+
+reg_reset:
+    clrf COUNTER_UPTO_10
+    clrf COUNTER_UPTO_2
+    clrf GP_COUNTER
+    call hc595_set
+    call delay_20ms
+    call hc595_clear
+    btfss GPIO, SW2
+    goto $-1
+    return
+
+handle_interrupt:
+    btfss GPIO, SW3
+    call reg_reset
+    btfss GPIO, SW2
+    call increment_ctrs
+    call delay_20ms
+    bcf INTCON, GPIF
+    return
+
+beepy_beep:
+    ;~ call hc595_set
+    movlw 0x05
+    movwf GP_COUNTER
+    movlw 0x10
+    movwf GP_COUNTER1
+    bcf GPIO, PIEZO
+    call delay_2ms
+    bsf GPIO, PIEZO
+    call delay_2ms
+    decfsz GP_COUNTER1, 1
+    goto $-5
+    decfsz GP_COUNTER, 1
+    goto $-9
+    return
+
+delay_2ms:
+    movlw 0x14
+    movwf DELAY_CTR1
+    movlw 0x19
+    movwf DELAY_CTR2
+    decfsz DELAY_CTR2, 1
+    goto $-1
+    decfsz DELAY_CTR1, 1
+    goto $-5
+    return
+    
+delay_20ms:
+    movlw 0xc8
+    movwf DELAY_CTR1
+    movlw 0x19
+    movwf DELAY_CTR2
+    decfsz DELAY_CTR2, 1
+    goto $-1
+    decfsz DELAY_CTR1, 1
+    goto $-5
+    return
+
+delay_100ms:
+    movlw 0x05
+    movwf DELAY_CTR3
+    call delay_20ms
+    decfsz DELAY_CTR3, 1
+    goto $-2
+    return
+
+delay_500ms:
+    call delay_100ms
+    call delay_100ms
+    call delay_100ms
+    call delay_100ms
+    call delay_100ms
+    return
+
+hc595_clear:
+    bcf GPIO, LED_DATA
+    bcf GPIO, LED_LATCH
+    bcf GPIO, LED_CLK
+    movlw 0x08
+    movwf GP_COUNTER
+    bsf GPIO, LED_CLK
+    bcf GPIO, LED_CLK
+    decfsz GP_COUNTER, 1
+    goto $-3
+    bsf GPIO, LED_LATCH
+    bcf GPIO, LED_LATCH
+    return
+
+hc595_set:
+    bsf GPIO, LED_DATA
+    bcf GPIO, LED_LATCH
+    bcf GPIO, LED_CLK
+    movlw 0x08
+    movwf GP_COUNTER
+    bsf GPIO, LED_CLK
+    bcf GPIO, LED_CLK
+    decfsz GP_COUNTER, 1
+    goto $-3
+    bsf GPIO, LED_LATCH
+    bcf GPIO, LED_LATCH
+    return
+
+increment_ctrs:
+    movlw 0x02
+    xorwf COUNTER_UPTO_2, 0; check of 20 counted already
+    btfsc STATUS, Z
+    return
+    incf COUNTER_UPTO_10, 1 ; increment ctr which is up to 10
+    ;~ movf COUNTER_UPTO_10, W
+    ;~ movwf CHAR_REG
+    ;~ call convert_chr_to_7s
+    ;~ call output_char_reg ; output it
+    movlw 0x0a
+    xorwf COUNTER_UPTO_10, 0 ; test ctr10
+    btfss STATUS, Z
+    goto $+4
+    clrf COUNTER_UPTO_10
+    incf COUNTER_UPTO_2, 1
+    call beepy_beep
+    ;~ movf COUNTER_UPTO_2, W
+    ;~ movwf CHAR_REG
+    ;~ call convert_chr_to_7s
+    ;~ call output_char_reg ; output ctr2
+    btfss GPIO, SW2
+    goto $-1
+    return
+
+output_char_reg:
+    movlw 0x08
+    movwf GP_COUNTER
+    bcf GPIO, LED_CLK
+    bcf GPIO, LED_LATCH
+output_loop:
+    rlf CHAR_REG, 1
+    btfsc STATUS, C
+    bsf GPIO, LED_DATA
+    btfss STATUS, C
+    bcf GPIO, LED_DATA
+    bsf GPIO, LED_CLK
+    bcf GPIO, LED_CLK
+    decfsz GP_COUNTER, 1
+    goto output_loop
+    bsf GPIO, LED_LATCH
+    bcf GPIO, LED_LATCH
+    return
+    
+convert_chr_to_7s: ; dumb simple convertion
+    movlw 0x00
+    xorwf CHAR_REG, 0
+    btfss STATUS, Z
+    goto $+3
+    movlw b'00111111' ; 012345
+    goto finish_conv
+    movlw 0x01
+    xorwf CHAR_REG, 0
+    btfss STATUS, Z
+    goto $+3
+    movlw b'00000110' ; 12
+    goto finish_conv
+    movlw 0x02
+    xorwf CHAR_REG, 0
+    btfss STATUS, Z
+    goto $+3
+    movlw b'01011011' ; 01346
+    goto finish_conv
+    movlw 0x03
+    xorwf CHAR_REG, 0
+    btfss STATUS, Z
+    goto $+3
+    movlw b'01001111' ; 01236
+    goto finish_conv
+    movlw 0x04
+    xorwf CHAR_REG, 0
+    btfss STATUS, Z
+    goto $+3
+    movlw b'01100110' ; 1256
+    goto finish_conv
+    movlw 0x05
+    xorwf CHAR_REG, 0
+    btfss STATUS, Z
+    goto $+3
+    movlw b'01101101' ; 02356
+    goto finish_conv
+    movlw 0x06
+    xorwf CHAR_REG, 0
+    btfss STATUS, Z
+    goto $+3
+    movlw b'01111101' ; 023456
+    goto finish_conv
+    movlw 0x07
+    xorwf CHAR_REG, 0
+    btfss STATUS, Z
+    goto $+3
+    movlw b'00000111' ; 012
+    goto finish_conv
+    movlw 0x08
+    xorwf CHAR_REG, 0
+    btfss STATUS, Z
+    goto $+3
+    movlw b'01111111'
+    ;~ movf sym_8, W
+    goto finish_conv
+    movlw 0x09
+    xorwf CHAR_REG, 0
+    btfss STATUS, Z
+    movlw b'01101111' ; 012356
+    movlw b'01101111' ; 012356
+    goto finish_conv
+    ; if nothing then output A
+    movlw b'01110111' ; 012456
+finish_conv:
+    movwf CHAR_REG
+    return
+
+    end
