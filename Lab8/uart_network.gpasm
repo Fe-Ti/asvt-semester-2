@@ -5,8 +5,8 @@
 ; Title: Lab 6|8 ASVT
 ; Description:
 ; Build UART 8p1 half duplex network with bus topology and speed 19.2 Kb/s
-; HD and bus topo means TX and RX are connected to same wire, so we're can use
-; only GP5 for comms.
+; HD and bus topo means TX and RX are connected to same wire, so we can use
+; only GP5 for comms, and have free IO pin (which goes to LEDs).
 ;
 ; 8p1 stands for:
 ;   8 - data bits
@@ -25,7 +25,7 @@
 ; GP2 == LED_LATCH
 ; GP3 == SW_GP3
 ; GP4 == LED_CLK
-; GP5 == SerialIn (and out due to HD mode)
+; GP5 == SerialIn (and out in HD mode)
 
 
 
@@ -42,15 +42,17 @@ SETUP_MODE  equ 0x0             ; Address setup mode identifier
 RUN_MODE    equ 0x1           ; Run mode id (used for handling interrupts)
 SETTING_PC_MODE equ 0x2
 SETTING_PA_MODE equ 0x3
-MAX_MODE    equ 0x4
+VIEW_MODE   equ 0x4
+MAX_MODE    equ 0x5
 
 
 GP0_SW      equ 0x00
 GP3_SW      equ 0x03
 GP5_RECVD   equ 0x05
 CAN_SEND    equ 0x01
-IS_NOT_WAITING  equ 0x02
 SEND_READY  equ 0x04
+MASTER_FLAG equ 0x06
+MASTER_IS_WAITING  equ 0x02
 
 LED_CLK     equ 0x04
 LED_LATCH   equ 0x02
@@ -61,7 +63,7 @@ SERIAL_IN   equ 0x05
 MASTER_ADDR equ 0x01
 
 MAX_ADDR    equ     0x05
-MAX_PAC_CONT equ    0x16 ; actually max+1
+MAX_PAC_CONT equ    0x10 ; actually max+1
 
 ;~ GP_CTR      equ 0x21 ; General purpose counter (used in reset)
 ;~ CHAR_IO_CTR equ 0x22 ; 
@@ -143,19 +145,28 @@ gpio_init:
     movlw   b'00101001' ; enable IOC for GP 3 and 5
     movwf   IOC
     bcf     STATUS, RP0 ; And switch to bank 0
-soft_reset:
-    movlw   REG_BANK_ADDR ; Register array address
-    movwf   FSR           ; is loaded to FSR
-    movlw   REG_BANK_SIZE ; Then loading size to GP_CTR
-    movwf   GP_CTR
-next_reg_reset:         ; Register clearing loop
-    clrf    INDF        ; use indirect access by pointer (FSR)
-    incf    FSR, 1      ; curent register pointer + 1
-    decfsz  GP_CTR, 1       ; decrement counter
-    goto    next_reg_reset  ; if we aren't done yet, then goto next
-    movlw   SETUP_MODE
-    movwf   MODE
+;~ soft_reset:
+    ;~ movlw   REG_BANK_ADDR ; Register array address
+    ;~ movwf   FSR           ; is loaded to FSR
+    ;~ movlw   REG_BANK_SIZE ; Then loading size to GP_CTR
+    ;~ movwf   GP_CTR
+;~ next_reg_reset:         ; Register clearing loop
+    ;~ clrf    INDF        ; use indirect access by pointer (FSR)
+    ;~ incf    FSR, 1      ; curent register pointer + 1
+    ;~ decfsz  GP_CTR, 1       ; decrement counter
+    ;~ goto    next_reg_reset  ; if we aren't done yet, then goto next
+
+    clrf    MODE
+    clrf    FLAG_REG
+    clrf    FROM
+    movlw   0x01
+    movwf   ADDRESS
+    call    update_from
+    bsf     FLAG_REG, MASTER_FLAG
+    bcf     FLAG_REG, MASTER_IS_WAITING
+    
     goto loop
+    
 
 process_msg:
     movf    RECVPAC, 0
@@ -174,11 +185,10 @@ process_msg:
     xorwf   ADDRESS, 0
     btfss   STATUS, Z
     return
-
 set_recieved_reg:
     movf    RECVPAC, 0
     movwf   RECIEVED_REG
-    addlw   b'00110000'
+    andlw   b'00110000'
     movwf   RECVPAC_FROM
     movlw   0x4
     movwf   GP_CTR
@@ -187,8 +197,11 @@ set_recieved_reg:
     decfsz  GP_CTR, 1
     goto    $-2
     movf    RECIEVED_REG, 0
-    addlw   b'00001111'
+    andlw   b'00001111'
     movwf   RECIEVED_REG
+    bcf     FLAG_REG, GP5_RECVD
+	movlw   b'00000100'
+	xorwf   FLAG_REG, 1
     return
 
 loop:
@@ -208,6 +221,10 @@ loop:
     xorwf   MODE, 0
     btfsc   STATUS, Z         ; if MODE == SET P[acket]A[ddress]
     call    set_pa_sub
+    movlw   VIEW_MODE
+    xorwf   MODE, 0
+    btfsc   STATUS, Z         ; if MODE == VIEW recieved packet
+    call    view_sub
     goto    loop
 
 setup_sub:
@@ -215,35 +232,40 @@ setup_sub:
     call    change_mode
     btfsc   FLAG_REG, GP3_SW
     call    inc_addr
-    movlw   b'11110000'
+    movlw   b'01111000'
     movwf   CHAR_IO_REG
     call    output_char_reg
     call    delay_500ms
-    movf    ADDRESS, 1
+    movf    ADDRESS, 0
     movwf   CHAR_IO_REG
-    call    output_char_reg
+    call    output_char_reg_7sc
     call    delay_500ms
     return
 
 run_sub:
     movlw   b'01010000'
     movwf   CHAR_IO_REG
+    btfsc   FLAG_REG, GP5_RECVD
+    iorlw   b'10000000'
     call    output_char_reg
     btfsc   FLAG_REG, GP0_SW
     call    change_mode
     btfsc   FLAG_REG, GP3_SW
-    bsf     FLAG_REG, SEND_READY
+    bsf     FLAG_REG, CAN_SEND
+    bcf     FLAG_REG, GP3_SW
     btfsc   FLAG_REG, GP5_RECVD
     call    process_msg
-    movlw   MASTER_ADDR
-    xorwf   ADDRESS, 0
-    btfss   STATUS, Z
+    btfss   FLAG_REG, MASTER_FLAG
     goto    run_sub_slave
 run_sub_master:
-    btfsc   FLAG_REG, IS_NOT_WAITING
+    btfsc   FLAG_REG, MASTER_IS_WAITING
+    return
+    btfsc   FLAG_REG, CAN_SEND
     call    transmit_packet
     return
-run_sub_slave:   
+run_sub_slave:
+    btfss   FLAG_REG, MASTER_IS_WAITING
+    return
     btfsc   FLAG_REG, CAN_SEND
     call    transmit_packet
     return
@@ -257,9 +279,9 @@ set_pc_sub:
     call    change_mode
     btfsc   FLAG_REG, GP3_SW
     call    inc_pc
-    movf    PACKET_REG, 0
+    movf    PAC_CONT, 0
     movwf   CHAR_IO_REG
-    call    output_char_reg
+    call    output_char_reg_7sc
     call    delay_500ms
     return
 
@@ -272,9 +294,9 @@ set_pa_sub:
     call    change_mode
     btfsc   FLAG_REG, GP3_SW
     call    inc_pa
-    movf    PACKET_REG, 0
+    movf    PAC_ADDR, 0
     movwf   CHAR_IO_REG
-    call    output_char_reg
+    call    output_char_reg_7sc
     call    delay_500ms
     return
 
@@ -286,8 +308,15 @@ view_sub:
     btfsc   FLAG_REG, GP0_SW
     call    change_mode
     bcf     FLAG_REG, GP3_SW
-    movf    RECVPAC, 0
+    movf    RECIEVED_REG, 0
     movwf   CHAR_IO_REG
+    call    output_char_reg_7sc
+    call    delay_500ms
+    movf    RECVPAC_FROM, 0
+    movwf   CHAR_IO_REG
+    call    conv_to_7sc
+    movlw   b'10000000'
+	iorwf   CHAR_IO_REG
     call    output_char_reg
     call    delay_500ms
     return
@@ -297,6 +326,7 @@ update_from:
     movwf   FROM
     movlw   0x4
     movwf   GP_CTR
+    bcf     STATUS, C
     rlf     FROM, 1
     decfsz  GP_CTR, 1
     goto    $-2
@@ -305,26 +335,27 @@ update_from:
 inc_addr:
     incf    ADDRESS, 1
     bcf     FLAG_REG, GP3_SW
+    bcf     FLAG_REG, MASTER_FLAG
     call    update_from
     movlw   MAX_ADDR
-    xorwf   ADDRESS, 0
-    btfss   STATUS, Z
+    subwf   ADDRESS, 0
+    btfss   STATUS, C
     return
     movlw   0x1
     movwf   ADDRESS
     call    update_from
     bcf     FLAG_REG, GP3_SW
+    bsf     FLAG_REG, MASTER_FLAG
     return
 
 inc_pa:
     incf    PAC_ADDR, 1
     bcf     FLAG_REG, GP3_SW
     movlw   MAX_ADDR
-    xorwf   PAC_ADDR, 0
-    btfss   STATUS, Z
+    subwf   PAC_ADDR, 0
+    btfss   STATUS, C
     return
-    movlw   0x1
-    movwf   PAC_ADDR
+    clrf    PAC_ADDR
     bcf     FLAG_REG, GP3_SW
     return
 
@@ -332,24 +363,25 @@ inc_pc:
     incf    PAC_CONT, 1
     bcf     FLAG_REG, GP3_SW
     movlw   MAX_PAC_CONT
-    xorwf   PAC_CONT, 0
-    btfss   STATUS, Z
+    subwf   PAC_CONT, 0
+    btfss   STATUS, C
     return
-    movlw   0x1
-    movwf   PAC_CONT
+    clrf    PAC_CONT
     bcf     FLAG_REG, GP3_SW
     return
 
 change_mode:
     incf    MODE, 1
     bcf     FLAG_REG, GP0_SW
+    bcf     FLAG_REG, GP3_SW
     movlw   MAX_MODE
-    xorwf   MODE, 0
-    btfss   STATUS, Z
+    subwf   MODE, 0
+    btfss   STATUS, C
     return
     movlw   0x1
     movwf   MODE
     bcf     FLAG_REG, GP0_SW
+    bcf     FLAG_REG, GP3_SW
     return
 
 
@@ -387,29 +419,12 @@ hc595_set:
     bcf     GPIO, LED_LATCH
     return
 
-output_char_reg:
-    movlw   0x08
-    movwf   CHAR_IO_CTR
-    bcf     GPIO, LED_CLK
-    bcf     GPIO, LED_LATCH
-output_loop:
-    rlf     CHAR_IO_REG, 1
-    btfsc   STATUS, C
-    bsf     GPIO, LED_DATA
-    btfss   STATUS, C
-    bcf     GPIO, LED_DATA
-    bsf     GPIO, LED_CLK
-    bcf     GPIO, LED_CLK
-    decfsz  CHAR_IO_CTR, 1
-    goto    output_loop
-    bsf     GPIO, LED_LATCH
-    bcf     GPIO, LED_LATCH
-    return
 
 recieve_packet:
-    movf    MODE, 1
+    movf    MODE, 1     ; do not recieve while is setting up address
     btfsc   STATUS, Z
     return
+    call    wait_samp_time   ; wait for start bit to end
     movlw   PACDATA_LEN
     movwf   RECVPAC_GPCTR1
 recieve_packet_cycle:           ;;;
@@ -430,6 +445,8 @@ recieve_packet_cycle:           ;;;
     return
 
 sample_bit:
+    clrf    RECVPAC_CTR_0
+    clrf    RECVPAC_CTR_1
     movlw   BIT_SAMPLES
     movwf   RECVPAC_GPCTR2
 sample_bit_cycle:
@@ -443,7 +460,7 @@ sample_bit_cycle:
 
 
 get_parity:
-    movlw   PACDATA_LEN
+    movlw   PACDATA_LEN + 0x01
     movwf   TRANSMIT_GPCTR1
 get_parity_cycle                    ;;;
     rlf     PACKET_REG, 1
@@ -490,6 +507,8 @@ transmit_packet:
     call    get_parity
     call    assemble_packet
     call    serial_tx_enbl
+    bcf     GPIO, SERIAL_IN
+    call    wait_samp_time
     movlw   PACDATA_LEN
     movwf   TRANSMIT_GPCTR1
 bit_transmit:                   ;;;
@@ -509,12 +528,21 @@ bit_transmit:                   ;;;
     bsf     GPIO, SERIAL_IN ;; send stop bits
     call    wait_samp_time
     call    serial_rx_enbl
+    clrf    PAC_ADDR
+    clrf    PAC_CONT
+    bcf     FLAG_REG, CAN_SEND
+	movlw   b'00000100'
+	xorwf   FLAG_REG, 1
     return
 
 wait_samp_time:
     movlw   BIT_SAMPLES
     movwf   TRANSMIT_GPCTR2
 wait_samp_t_cycle:
+    nop
+    nop
+    nop
+    nop
     decfsz  TRANSMIT_GPCTR2, 1 ; wait for sampling
     goto    wait_samp_t_cycle
     return
@@ -556,6 +584,132 @@ delay_500ms:
     call    delay_100ms
     call    delay_100ms
     call    delay_100ms
+    return
+
+output_char_reg_7sc:
+    call    conv_to_7sc
+    call    output_char_reg
+    return
+
+conv_to_7sc: ; dumb simple convertion
+    movlw 0x00
+    xorwf CHAR_IO_REG, 0
+    btfss STATUS, Z
+    goto $+3
+    movlw b'00111111' ; 012345
+    goto finish_conv
+    movlw 0x01
+    xorwf CHAR_IO_REG, 0
+    btfss STATUS, Z
+    goto $+3
+    movlw b'00000110' ; 12
+    goto finish_conv
+    movlw 0x02
+    xorwf CHAR_IO_REG, 0
+    btfss STATUS, Z
+    goto $+3
+    movlw b'01011011' ; 01346
+    goto finish_conv
+    movlw 0x03
+    xorwf CHAR_IO_REG, 0
+    btfss STATUS, Z
+    goto $+3
+    movlw b'01001111' ; 01236
+    goto finish_conv
+    movlw 0x04
+    xorwf CHAR_IO_REG, 0
+    btfss STATUS, Z
+    goto $+3
+    movlw b'01100110' ; 1256
+    goto finish_conv
+    movlw 0x05
+    xorwf CHAR_IO_REG, 0
+    btfss STATUS, Z
+    goto $+3
+    movlw b'01101101' ; 02356
+    goto finish_conv
+    movlw 0x06
+    xorwf CHAR_IO_REG, 0
+    btfss STATUS, Z
+    goto $+3
+    movlw b'01111101' ; 023456
+    goto finish_conv
+    movlw 0x07
+    xorwf CHAR_IO_REG, 0
+    btfss STATUS, Z
+    goto $+3
+    movlw b'00000111' ; 012
+    goto finish_conv
+    movlw 0x08
+    xorwf CHAR_IO_REG, 0
+    btfss STATUS, Z
+    goto $+3
+    movlw b'01111111'
+    goto finish_conv
+    movlw 0x09
+    xorwf CHAR_IO_REG, 0
+    btfss STATUS, Z
+    goto $+3
+    movlw b'01101111' ; 012356
+    goto finish_conv
+    movlw 0x0a
+    xorwf CHAR_IO_REG, 0
+    btfss STATUS, Z
+    goto $+3
+    movlw b'01011101' ; 012356
+    goto finish_conv
+    movlw 0x0b
+    xorwf CHAR_IO_REG, 0
+    btfss STATUS, Z
+    goto $+3
+    movlw b'01000001' ; 012356
+    goto finish_conv
+    movlw 0x0c
+    xorwf CHAR_IO_REG, 0
+    btfss STATUS, Z
+    goto $+3
+    movlw b'00010101' ; 012356
+    goto finish_conv
+    movlw 0x0d
+    xorwf CHAR_IO_REG, 0
+    btfss STATUS, Z
+    goto $+3
+    movlw b'01011110' ; 012356
+    goto finish_conv
+    movlw 0x0e
+    xorwf CHAR_IO_REG, 0
+    btfss STATUS, Z
+    goto $+3
+    movlw b'01111001' ; 012356
+    goto finish_conv
+    movlw 0x0f
+    xorwf CHAR_IO_REG, 0
+    btfss STATUS, Z
+    goto $+3
+    movlw b'01110001' ; 012356
+    goto finish_conv
+	movlw b'11000000'
+finish_conv:
+    movwf CHAR_IO_REG
+    return
+
+output_char_reg:
+    movlw   0x08
+    movwf   CHAR_IO_CTR
+    bcf     GPIO, LED_CLK
+    bcf     GPIO, LED_LATCH
+output_loop:
+    rlf     CHAR_IO_REG, 1
+    btfsc   STATUS, C
+    bsf     GPIO, LED_DATA
+    btfss   STATUS, C
+    bcf     GPIO, LED_DATA
+    bsf     GPIO, LED_CLK
+    bcf     GPIO, LED_CLK
+    decfsz  CHAR_IO_CTR, 1
+    goto    output_loop
+    bsf     GPIO, LED_LATCH
+    bcf     GPIO, LED_LATCH
     return
 
     end
